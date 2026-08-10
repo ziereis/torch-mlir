@@ -645,6 +645,134 @@ func.func @test_matmulinteger_no_zero_points_batched(%arg0: !torch.vtensor<[2,40
 
 // -----
 
+// CHECK-LABEL: @test_matmulintegertofloat
+func.func @test_matmulintegertofloat(%arg0: !torch.vtensor<[4,3],ui8>, %arg1: !torch.vtensor<[3,2],si8>, %arg2: !torch.vtensor<[],f32>, %arg3: !torch.vtensor<[],f32>, %arg4: !torch.vtensor<[],ui8>, %arg5: !torch.vtensor<[],si8>) -> !torch.vtensor<[4,2],f32> attributes {torch.onnx_meta.opset_version = 21 : si64, torch.onnx_meta.opset_versions = {com.microsoft = 1 : si64}} {
+  // The quantized dtype determines the clamping range and the `dtype` argument:
+  // [0, 255] and 0 (Byte) for ui8, [-128, 127] and 1 (Char) for si8. The
+  // `out_dtype` argument is 6 (Float) for both.
+  // CHECK: %[[A_QMIN:.*]] = torch.constant.int 0{{$}}
+  // CHECK: %[[A_QMAX:.*]] = torch.constant.int 255{{$}}
+  // CHECK: %[[A_DTYPE:.*]] = torch.constant.int 0{{$}}
+  // CHECK: %[[A_ODTYPE:.*]] = torch.constant.int 6{{$}}
+  // CHECK: %[[A_SCALE:.*]] = torch.aten.item %arg2
+  // CHECK: %[[A_ZP:.*]] = torch.aten.item %arg4
+  // CHECK: %[[A_F32:.*]] = torch.quantized_decomposed.dequantize_per_tensor %arg0, %[[A_SCALE]], %[[A_ZP]], %[[A_QMIN]], %[[A_QMAX]], %[[A_DTYPE]], %[[A_ODTYPE]] : {{.*}} -> !torch.vtensor<[4,3],f32>
+  // CHECK: %[[B_QMIN:.*]] = torch.constant.int -128{{$}}
+  // CHECK: %[[B_QMAX:.*]] = torch.constant.int 127{{$}}
+  // CHECK: %[[B_DTYPE:.*]] = torch.constant.int 1{{$}}
+  // CHECK: %[[B_ODTYPE:.*]] = torch.constant.int 6{{$}}
+  // CHECK: %[[B_SCALE:.*]] = torch.aten.item %arg3
+  // CHECK: %[[B_ZP:.*]] = torch.aten.item %arg5
+  // CHECK: %[[B_F32:.*]] = torch.quantized_decomposed.dequantize_per_tensor %arg1, %[[B_SCALE]], %[[B_ZP]], %[[B_QMIN]], %[[B_QMAX]], %[[B_DTYPE]], %[[B_ODTYPE]] : {{.*}} -> !torch.vtensor<[3,2],f32>
+  // CHECK: %[[MM:.*]] = torch.aten.matmul %[[A_F32]], %[[B_F32]] : !torch.vtensor<[4,3],f32>, !torch.vtensor<[3,2],f32> -> !torch.vtensor<[4,2],f32>
+  // CHECK: return %[[MM]] : !torch.vtensor<[4,2],f32>
+  %0 = torch.operator "onnx.MatMulIntegerToFloat"(%arg0, %arg1, %arg2, %arg3, %arg4, %arg5) : (!torch.vtensor<[4,3],ui8>, !torch.vtensor<[3,2],si8>, !torch.vtensor<[],f32>, !torch.vtensor<[],f32>, !torch.vtensor<[],ui8>, !torch.vtensor<[],si8>) -> !torch.vtensor<[4,2],f32>
+  return %0 : !torch.vtensor<[4,2],f32>
+}
+
+// -----
+
+// Omitted optional inputs are imported as `none` operands, so the zero points
+// default to 0 while the trailing bias is still present.
+// CHECK-LABEL: @test_matmulintegertofloat_bias_omitted_zero_points
+func.func @test_matmulintegertofloat_bias_omitted_zero_points(%arg0: !torch.vtensor<[4,3],ui8>, %arg1: !torch.vtensor<[3,2],si8>, %arg2: !torch.vtensor<[],f32>, %arg3: !torch.vtensor<[],f32>, %arg4: !torch.vtensor<[2],f32>) -> !torch.vtensor<[4,2],f32> attributes {torch.onnx_meta.opset_version = 21 : si64, torch.onnx_meta.opset_versions = {com.microsoft = 1 : si64}} {
+  %none = torch.constant.none
+  // CHECK: %[[A_SCALE:.*]] = torch.aten.item %arg2
+  // CHECK: %[[A_ZP:.*]] = torch.constant.int 0{{$}}
+  // CHECK: %[[A_F32:.*]] = torch.quantized_decomposed.dequantize_per_tensor %arg0, %[[A_SCALE]], %[[A_ZP]], %{{.*}}, %{{.*}}, %{{.*}}, %{{.*}} : {{.*}} -> !torch.vtensor<[4,3],f32>
+  // CHECK: %[[B_SCALE:.*]] = torch.aten.item %arg3
+  // CHECK: %[[B_ZP:.*]] = torch.constant.int 0{{$}}
+  // CHECK: %[[B_F32:.*]] = torch.quantized_decomposed.dequantize_per_tensor %arg1, %[[B_SCALE]], %[[B_ZP]], %{{.*}}, %{{.*}}, %{{.*}}, %{{.*}} : {{.*}} -> !torch.vtensor<[3,2],f32>
+  // CHECK: %[[MM:.*]] = torch.aten.matmul %[[A_F32]], %[[B_F32]]
+  // CHECK: %[[ALPHA:.*]] = torch.constant.int 1{{$}}
+  // CHECK: %[[RESULT:.*]] = torch.aten.add.Tensor %[[MM]], %arg4, %[[ALPHA]] : !torch.vtensor<[4,2],f32>, !torch.vtensor<[2],f32>, !torch.int -> !torch.vtensor<[4,2],f32>
+  // CHECK: return %[[RESULT]] : !torch.vtensor<[4,2],f32>
+  %0 = torch.operator "onnx.MatMulIntegerToFloat"(%arg0, %arg1, %arg2, %arg3, %none, %none, %arg4) : (!torch.vtensor<[4,3],ui8>, !torch.vtensor<[3,2],si8>, !torch.vtensor<[],f32>, !torch.vtensor<[],f32>, !torch.none, !torch.none, !torch.vtensor<[2],f32>) -> !torch.vtensor<[4,2],f32>
+  return %0 : !torch.vtensor<[4,2],f32>
+}
+
+// -----
+
+// A 1-D quantization parameter holds one element per column, so the per-channel
+// axis is the last dimension of its matrix.
+// CHECK-LABEL: @test_matmulintegertofloat_per_channel_rhs
+func.func @test_matmulintegertofloat_per_channel_rhs(%arg0: !torch.vtensor<[1,4,3],ui8>, %arg1: !torch.vtensor<[3,2],si8>, %arg2: !torch.vtensor<[],f32>, %arg3: !torch.vtensor<[2],f32>, %arg4: !torch.vtensor<[],ui8>, %arg5: !torch.vtensor<[2],si8>) -> !torch.vtensor<[1,4,2],f32> attributes {torch.onnx_meta.opset_version = 21 : si64, torch.onnx_meta.opset_versions = {com.microsoft = 1 : si64}} {
+  // CHECK: %[[A_F32:.*]] = torch.quantized_decomposed.dequantize_per_tensor %arg0, %{{.*}}, %{{.*}}, %{{.*}}, %{{.*}}, %{{.*}}, %{{.*}} : {{.*}} -> !torch.vtensor<[1,4,3],f32>
+  // CHECK: %[[B_QMIN:.*]] = torch.constant.int -128{{$}}
+  // CHECK: %[[B_QMAX:.*]] = torch.constant.int 127{{$}}
+  // CHECK: %[[B_DTYPE:.*]] = torch.constant.int 1{{$}}
+  // CHECK: %[[B_ODTYPE:.*]] = torch.constant.int 6{{$}}
+  // CHECK: %[[B_AXIS:.*]] = torch.constant.int 1{{$}}
+  // CHECK: %[[B_F32:.*]] = torch.quantized_decomposed.dequantize_per_channel %arg1, %arg3, %arg5, %[[B_AXIS]], %[[B_QMIN]], %[[B_QMAX]], %[[B_DTYPE]], %[[B_ODTYPE]] : {{.*}} -> !torch.vtensor<[3,2],f32>
+  // CHECK: %[[RESULT:.*]] = torch.aten.matmul %[[A_F32]], %[[B_F32]] : !torch.vtensor<[1,4,3],f32>, !torch.vtensor<[3,2],f32> -> !torch.vtensor<[1,4,2],f32>
+  // CHECK: return %[[RESULT]] : !torch.vtensor<[1,4,2],f32>
+  %0 = torch.operator "onnx.MatMulIntegerToFloat"(%arg0, %arg1, %arg2, %arg3, %arg4, %arg5) : (!torch.vtensor<[1,4,3],ui8>, !torch.vtensor<[3,2],si8>, !torch.vtensor<[],f32>, !torch.vtensor<[2],f32>, !torch.vtensor<[],ui8>, !torch.vtensor<[2],si8>) -> !torch.vtensor<[1,4,2],f32>
+  return %0 : !torch.vtensor<[1,4,2],f32>
+}
+
+// -----
+
+// Per-channel quantization is allowed on either matrix, and an absent zero point
+// becomes a `none` operand denoting symmetric quantization.
+// CHECK-LABEL: @test_matmulintegertofloat_per_channel_lhs_no_zero_points
+func.func @test_matmulintegertofloat_per_channel_lhs_no_zero_points(%arg0: !torch.vtensor<[4,3],ui8>, %arg1: !torch.vtensor<[3,2],si8>, %arg2: !torch.vtensor<[3],f32>, %arg3: !torch.vtensor<[],f32>) -> !torch.vtensor<[4,2],f32> attributes {torch.onnx_meta.opset_version = 21 : si64, torch.onnx_meta.opset_versions = {com.microsoft = 1 : si64}} {
+  // CHECK: %[[A_NONE:.*]] = torch.constant.none
+  // CHECK: %[[A_AXIS:.*]] = torch.constant.int 1{{$}}
+  // CHECK: %[[A_F32:.*]] = torch.quantized_decomposed.dequantize_per_channel %arg0, %arg2, %[[A_NONE]], %[[A_AXIS]], %{{.*}}, %{{.*}}, %{{.*}}, %{{.*}} : {{.*}} -> !torch.vtensor<[4,3],f32>
+  // CHECK: %[[B_F32:.*]] = torch.quantized_decomposed.dequantize_per_tensor %arg1, %{{.*}}, %{{.*}}, %{{.*}}, %{{.*}}, %{{.*}}, %{{.*}} : {{.*}} -> !torch.vtensor<[3,2],f32>
+  // CHECK: %[[RESULT:.*]] = torch.aten.matmul %[[A_F32]], %[[B_F32]]
+  // CHECK: return %[[RESULT]] : !torch.vtensor<[4,2],f32>
+  %0 = torch.operator "onnx.MatMulIntegerToFloat"(%arg0, %arg1, %arg2, %arg3) : (!torch.vtensor<[4,3],ui8>, !torch.vtensor<[3,2],si8>, !torch.vtensor<[3],f32>, !torch.vtensor<[],f32>) -> !torch.vtensor<[4,2],f32>
+  return %0 : !torch.vtensor<[4,2],f32>
+}
+
+// -----
+
+// Single-element quantization parameters are per-tensor and get reshaped to
+// scalars before extraction.
+// CHECK-LABEL: @test_matmulintegertofloat_single_element_qparams
+func.func @test_matmulintegertofloat_single_element_qparams(%arg0: !torch.vtensor<[4,3],ui8>, %arg1: !torch.vtensor<[3,2],si8>, %arg2: !torch.vtensor<[1],f32>, %arg3: !torch.vtensor<[1],f32>, %arg4: !torch.vtensor<[1],ui8>, %arg5: !torch.vtensor<[1],si8>) -> !torch.vtensor<[4,2],f32> attributes {torch.onnx_meta.opset_version = 21 : si64, torch.onnx_meta.opset_versions = {com.microsoft = 1 : si64}} {
+  // CHECK: %[[A_SCALE_0D:.*]] = torch.aten.reshape %arg2, %{{.*}} : !torch.vtensor<[1],f32>, !torch.list<int> -> !torch.vtensor<[],f32>
+  // CHECK: %[[A_SCALE:.*]] = torch.aten.item %[[A_SCALE_0D]]
+  // CHECK: %[[A_ZP_0D:.*]] = torch.aten.reshape %arg4, %{{.*}} : !torch.vtensor<[1],ui8>, !torch.list<int> -> !torch.vtensor<[],ui8>
+  // CHECK: %[[A_ZP:.*]] = torch.aten.item %[[A_ZP_0D]]
+  // CHECK: %[[A_F32:.*]] = torch.quantized_decomposed.dequantize_per_tensor %arg0, %[[A_SCALE]], %[[A_ZP]], %{{.*}}, %{{.*}}, %{{.*}}, %{{.*}} : {{.*}} -> !torch.vtensor<[4,3],f32>
+  // CHECK: %[[B_F32:.*]] = torch.quantized_decomposed.dequantize_per_tensor %arg1, %{{.*}}, %{{.*}}, %{{.*}}, %{{.*}}, %{{.*}}, %{{.*}} : {{.*}} -> !torch.vtensor<[3,2],f32>
+  // CHECK: %[[RESULT:.*]] = torch.aten.matmul %[[A_F32]], %[[B_F32]]
+  // CHECK: return %[[RESULT]] : !torch.vtensor<[4,2],f32>
+  %0 = torch.operator "onnx.MatMulIntegerToFloat"(%arg0, %arg1, %arg2, %arg3, %arg4, %arg5) : (!torch.vtensor<[4,3],ui8>, !torch.vtensor<[3,2],si8>, !torch.vtensor<[1],f32>, !torch.vtensor<[1],f32>, !torch.vtensor<[1],ui8>, !torch.vtensor<[1],si8>) -> !torch.vtensor<[4,2],f32>
+  return %0 : !torch.vtensor<[4,2],f32>
+}
+
+// -----
+
+// CHECK-LABEL: @test_matmulintegertofloat_dynamic_per_channel_rhs
+func.func @test_matmulintegertofloat_dynamic_per_channel_rhs(%arg0: !torch.vtensor<[?,?],ui8>, %arg1: !torch.vtensor<[3,?],si8>, %arg2: !torch.vtensor<[],f32>, %arg3: !torch.vtensor<[2],f32>) -> !torch.vtensor<[?,?],f32> attributes {torch.onnx_meta.opset_version = 21 : si64, torch.onnx_meta.opset_versions = {com.microsoft = 1 : si64}} {
+  // CHECK: %[[A_F32:.*]] = torch.quantized_decomposed.dequantize_per_tensor %arg0, %{{.*}}, %{{.*}}, %{{.*}}, %{{.*}}, %{{.*}}, %{{.*}} : {{.*}} -> !torch.vtensor<[?,?],f32>
+  // CHECK: %[[B_F32:.*]] = torch.quantized_decomposed.dequantize_per_channel %arg1, %arg3, %{{.*}}, %{{.*}}, %{{.*}}, %{{.*}}, %{{.*}}, %{{.*}} : {{.*}} -> !torch.vtensor<[3,?],f32>
+  // CHECK: %[[RESULT:.*]] = torch.aten.matmul %[[A_F32]], %[[B_F32]] : !torch.vtensor<[?,?],f32>, !torch.vtensor<[3,?],f32> -> !torch.vtensor<[?,?],f32>
+  // CHECK: return %[[RESULT]] : !torch.vtensor<[?,?],f32>
+  %0 = torch.operator "onnx.MatMulIntegerToFloat"(%arg0, %arg1, %arg2, %arg3) : (!torch.vtensor<[?,?],ui8>, !torch.vtensor<[3,?],si8>, !torch.vtensor<[],f32>, !torch.vtensor<[2],f32>) -> !torch.vtensor<[?,?],f32>
+  return %0 : !torch.vtensor<[?,?],f32>
+}
+
+// -----
+
+// An f16 result dequantizes straight to f16, i.e. `out_dtype` is 5 (Half).
+// CHECK-LABEL: @test_matmulintegertofloat_f16
+func.func @test_matmulintegertofloat_f16(%arg0: !torch.vtensor<[4,3],si8>, %arg1: !torch.vtensor<[3,2],si8>, %arg2: !torch.vtensor<[],f16>, %arg3: !torch.vtensor<[],f16>) -> !torch.vtensor<[4,2],f16> attributes {torch.onnx_meta.opset_version = 21 : si64, torch.onnx_meta.opset_versions = {com.microsoft = 1 : si64}} {
+  // CHECK: %[[A_ODTYPE:.*]] = torch.constant.int 5{{$}}
+  // CHECK: %[[A_F16:.*]] = torch.quantized_decomposed.dequantize_per_tensor %arg0, %{{.*}}, %{{.*}}, %{{.*}}, %{{.*}}, %{{.*}}, %[[A_ODTYPE]] : {{.*}} -> !torch.vtensor<[4,3],f16>
+  // CHECK: %[[B_ODTYPE:.*]] = torch.constant.int 5{{$}}
+  // CHECK: %[[B_F16:.*]] = torch.quantized_decomposed.dequantize_per_tensor %arg1, %{{.*}}, %{{.*}}, %{{.*}}, %{{.*}}, %{{.*}}, %[[B_ODTYPE]] : {{.*}} -> !torch.vtensor<[3,2],f16>
+  // CHECK: %[[RESULT:.*]] = torch.aten.matmul %[[A_F16]], %[[B_F16]] : !torch.vtensor<[4,3],f16>, !torch.vtensor<[3,2],f16> -> !torch.vtensor<[4,2],f16>
+  // CHECK: return %[[RESULT]] : !torch.vtensor<[4,2],f16>
+  %0 = torch.operator "onnx.MatMulIntegerToFloat"(%arg0, %arg1, %arg2, %arg3) : (!torch.vtensor<[4,3],si8>, !torch.vtensor<[3,2],si8>, !torch.vtensor<[],f16>, !torch.vtensor<[],f16>) -> !torch.vtensor<[4,2],f16>
+  return %0 : !torch.vtensor<[4,2],f16>
+}
+
+// -----
+
 // CHECK-LABEL: func.func @test_mul
   func.func @test_mul(%arg0: !torch.vtensor<[3,4,5],f32>, %arg1: !torch.vtensor<[3,4,5],f32>) -> !torch.vtensor<[3,4,5],f32> attributes {torch.onnx_meta.ir_version = 7 : si64, torch.onnx_meta.opset_version = 14 : si64, torch.onnx_meta.producer_name = "backend-test", torch.onnx_meta.producer_version = ""} {
     // CHECK: torch.aten.mul.Tensor %arg0, %arg1 : !torch.vtensor<[3,4,5],f32>, !torch.vtensor<[3,4,5],f32> -> !torch.vtensor<[3,4,5],f32>

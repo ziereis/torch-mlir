@@ -17,6 +17,168 @@ using namespace mlir;
 using namespace mlir::torch;
 using namespace mlir::torch::onnx_c;
 
+namespace {
+
+// A quantized tensor operand of `MatMulIntegerToFloat` together with its
+// validated quantization parameters. `axis` is only set for per-channel
+// quantization.
+struct QuantizedTensorInfo {
+  Value value;
+  Value scale;
+  std::optional<Value> zeroPoint;
+  std::optional<int64_t> axis;
+};
+
+bool areCompatibleSizes(int64_t lhs, int64_t rhs) {
+  return lhs == Torch::kUnknownSize || rhs == Torch::kUnknownSize || lhs == rhs;
+}
+
+// A scalar or single-element quantization parameter denotes per-tensor
+// quantization, any other one-dimensional one denotes per-channel quantization.
+bool isPerTensorQParam(ArrayRef<int64_t> qparamSizes) {
+  return qparamSizes.empty() || qparamSizes[0] == 1;
+}
+
+// Validates one quantized tensor operand and its quantization parameters, where
+// `name` identifies the operand in diagnostics.
+FailureOr<QuantizedTensorInfo>
+matchQuantizedTensor(ConversionPatternRewriter &rewriter, Operation *op,
+                     StringRef name, Value value, Value scale,
+                     std::optional<Value> zeroPoint) {
+  auto valueType = dyn_cast<Torch::ValueTensorType>(value.getType());
+  if (!valueType || !valueType.hasSizes() || !valueType.hasDtype())
+    return rewriter.notifyMatchFailure(
+        op, Twine("expected ") + name +
+                " to be a ranked tensor with a known dtype");
+
+  auto valueDtype = dyn_cast<IntegerType>(valueType.getDtype());
+  if (!valueDtype || valueDtype.isSignless() || valueDtype.getWidth() != 8)
+    return rewriter.notifyMatchFailure(
+        op, Twine("expected ") + name +
+                " to have a signed or unsigned 8-bit integer dtype");
+
+  auto scaleType = dyn_cast<Torch::ValueTensorType>(scale.getType());
+  if (!scaleType || !scaleType.hasSizes() || !scaleType.hasDtype() ||
+      !isa<FloatType>(scaleType.getDtype()))
+    return rewriter.notifyMatchFailure(
+        op,
+        Twine("expected the ") + name + " scale to be a ranked float tensor");
+
+  // Each quantization parameter is either a scalar, denoting per-tensor
+  // quantization, or a one-dimensional tensor holding one element per column of
+  // the tensor, denoting per-channel quantization.
+  ArrayRef<int64_t> scaleSizes = scaleType.getSizes();
+  if (scaleSizes.size() > 1)
+    return rewriter.notifyMatchFailure(
+        op, Twine("expected the ") + name +
+                " scale to be a scalar or a 1-D tensor");
+
+  ArrayRef<int64_t> zeroPointSizes;
+  if (zeroPoint) {
+    auto zeroPointType = dyn_cast<Torch::ValueTensorType>(zeroPoint->getType());
+    if (!zeroPointType || !zeroPointType.hasSizes() ||
+        zeroPointType.getDtype() != valueDtype)
+      return rewriter.notifyMatchFailure(
+          op, Twine("expected the ") + name +
+                  " zero point to be a ranked tensor with the same dtype as " +
+                  name);
+
+    zeroPointSizes = zeroPointType.getSizes();
+    if (zeroPointSizes.size() > 1)
+      return rewriter.notifyMatchFailure(
+          op, Twine("expected the ") + name +
+                  " zero point to be a scalar or a 1-D tensor");
+
+    // The operator allows the scale and the zero point to independently be
+    // scalars or 1-D tensors, but `quantized_decomposed.dequantize_per_channel`
+    // takes either no zero point or exactly one per channel, so the two have to
+    // agree here.
+    if (isPerTensorQParam(scaleSizes) != isPerTensorQParam(zeroPointSizes))
+      return rewriter.notifyMatchFailure(
+          op, Twine("unimplemented: the ") + name +
+                  " scale and zero point must either both be per-tensor or "
+                  "both be per-channel");
+  }
+
+  if (isPerTensorQParam(scaleSizes))
+    return QuantizedTensorInfo{value, scale, zeroPoint, /*axis=*/std::nullopt};
+
+  // Per-channel quantization holds one quantization parameter per column, i.e.
+  // per element of the tensor's last dimension.
+  ArrayRef<int64_t> valueSizes = valueType.getSizes();
+  if (valueSizes.empty())
+    return rewriter.notifyMatchFailure(
+        op, Twine("expected ") + name +
+                " to have a rank of at least 1 for per-channel quantization");
+
+  int64_t axis = valueSizes.size() - 1;
+  if (!areCompatibleSizes(valueSizes[axis], scaleSizes[0]))
+    return rewriter.notifyMatchFailure(
+        op, Twine("expected the ") + name +
+                " scale to hold one element per column of " + name);
+
+  if (zeroPoint && !areCompatibleSizes(scaleSizes[0], zeroPointSizes[0]))
+    return rewriter.notifyMatchFailure(
+        op, Twine("expected the ") + name +
+                " scale and zero point to hold the same number of elements");
+
+  return QuantizedTensorInfo{value, scale, zeroPoint, axis};
+}
+
+// Dequantizes the tensor described by `info` into a tensor of `resultDtype`.
+Value createDequantizeOp(ConversionPatternRewriter &rewriter, Location loc,
+                         const QuantizedTensorInfo &info, Type resultDtype) {
+  auto valueType = cast<Torch::ValueTensorType>(info.value.getType());
+  auto valueDtype = cast<IntegerType>(valueType.getDtype());
+  bool isUnsigned = valueDtype.isUnsigned();
+
+  auto constantInt = [&](int64_t value) -> Value {
+    return Torch::ConstantIntOp::create(rewriter, loc,
+                                        rewriter.getI64IntegerAttr(value));
+  };
+  auto constantScalarType = [&](Type type) -> Value {
+    return constantInt(static_cast<int64_t>(Torch::getScalarTypeForType(type)));
+  };
+
+  Value quantMin = constantInt(isUnsigned ? 0 : -128);
+  Value quantMax = constantInt(isUnsigned ? 255 : 127);
+  Value dtype = constantScalarType(valueDtype);
+  Value outDtype = constantScalarType(resultDtype);
+  auto dequantizedType = rewriter.getType<Torch::ValueTensorType>(
+      valueType.getOptionalSizes(), resultDtype);
+
+  if (info.axis) {
+    Value zeroPoints = info.zeroPoint
+                           ? *info.zeroPoint
+                           : Torch::ConstantNoneOp::create(rewriter, loc);
+    return Torch::QuantizedDecomposedDequantizePerChannelOp::create(
+        rewriter, loc, dequantizedType, info.value, info.scale, zeroPoints,
+        constantInt(*info.axis), quantMin, quantMax, dtype, outDtype);
+  }
+
+  Value scale;
+  Value zeroPoint;
+  if (info.zeroPoint) {
+    // Cannot fail: the quantization parameters were validated to hold a single
+    // element.
+    LogicalResult extracted = extractPerTensorQuantizationArguments(
+        rewriter, loc, info.scale, *info.zeroPoint, scale, zeroPoint);
+    assert(succeeded(extracted) &&
+           "per-tensor quantization arguments must be extractable");
+    (void)extracted;
+  } else {
+    scale = Torch::AtenItemOp::create(
+        rewriter, loc, rewriter.getType<Torch::FloatType>(), info.scale);
+    zeroPoint = constantInt(0);
+  }
+
+  return Torch::QuantizedDecomposedDequantizePerTensorOp::create(
+      rewriter, loc, dequantizedType, info.value, scale, zeroPoint, quantMin,
+      quantMax, dtype, outDtype);
+}
+
+} // namespace
+
 void mlir::torch::onnx_c::populateComMicrosoftDomain(
     OnnxCustomOpConversionPattern &patterns) {
   patterns.onOp(
@@ -929,6 +1091,76 @@ void mlir::torch::onnx_c::populateComMicrosoftDomain(
             rewriter, loc, resultTypes[0], attnTransposed, cstDim2, cstDim3);
 
         rewriter.replaceOp(binder.op, {attention, presentKey, presentValue});
+        return success();
+      });
+  patterns.onOp(
+      "MatMulIntegerToFloat", 1,
+      [](OpBinder binder, ConversionPatternRewriter &rewriter) {
+        // Dequantizes both matrices and performs the matrix multiplication in
+        // floating point. See the operator definition at
+        // https://github.com/microsoft/onnxruntime/blob/main/docs/ContribOperators.md
+        Location loc = binder.getLoc();
+        Torch::ValueTensorType resultType;
+        Value a, b, aScale, bScale;
+        if (binder.tensorOperandAtIndex(a, 0) ||
+            binder.tensorOperandAtIndex(b, 1) ||
+            binder.tensorOperandAtIndex(aScale, 2) ||
+            binder.tensorOperandAtIndex(bScale, 3) ||
+            binder.tensorResultType(resultType))
+          return rewriter.notifyMatchFailure(
+              binder.op, "failed to bind required inputs or result");
+
+        // Omitted optional inputs are imported as `none` operands, which do not
+        // bind as tensors.
+        auto optionalTensorOperand =
+            [&binder](int64_t index) -> std::optional<Value> {
+          Value operand;
+          if (binder.tensorOperandAtIndex(operand, index))
+            return std::nullopt;
+          return operand;
+        };
+        std::optional<Value> aZeroPoint = optionalTensorOperand(4);
+        std::optional<Value> bZeroPoint = optionalTensorOperand(5);
+        std::optional<Value> bias = optionalTensorOperand(6);
+
+        Type resultDtype = resultType.getOptionalDtype();
+        if (!isa_and_present<Float16Type, Float32Type>(resultDtype))
+          return rewriter.notifyMatchFailure(
+              binder.op, "expected an f16 or f32 result dtype");
+
+        if (bias) {
+          auto biasType = dyn_cast<Torch::ValueTensorType>(bias->getType());
+          if (!biasType || !biasType.hasDtype() ||
+              biasType.getDtype() != resultDtype)
+            return rewriter.notifyMatchFailure(
+                binder.op, "expected the bias dtype to match the result dtype");
+        }
+
+        FailureOr<QuantizedTensorInfo> aInfo = matchQuantizedTensor(
+            rewriter, binder.op, "A", a, aScale, aZeroPoint);
+        if (failed(aInfo))
+          return failure();
+
+        FailureOr<QuantizedTensorInfo> bInfo = matchQuantizedTensor(
+            rewriter, binder.op, "B", b, bScale, bZeroPoint);
+        if (failed(bInfo))
+          return failure();
+
+        Value dequantizedA =
+            createDequantizeOp(rewriter, loc, *aInfo, resultDtype);
+        Value dequantizedB =
+            createDequantizeOp(rewriter, loc, *bInfo, resultDtype);
+        Value result = Torch::AtenMatmulOp::create(rewriter, loc, resultType,
+                                                   dequantizedA, dequantizedB);
+
+        if (bias) {
+          Value one = Torch::ConstantIntOp::create(
+              rewriter, loc, rewriter.getI64IntegerAttr(1));
+          result = Torch::AtenAddTensorOp::create(rewriter, loc, resultType,
+                                                  result, *bias, one);
+        }
+
+        rewriter.replaceOp(binder.op, result);
         return success();
       });
   patterns.onOp(
